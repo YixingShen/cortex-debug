@@ -428,6 +428,8 @@ export class GDBDebugSession extends LoggingDebugSession {
     private getTCPPorts(useParent): Thenable<void> {
         return new Promise((resolve, reject) => {
             const startPort = 50000;
+            //const startPort = 3333; //20220513
+
             if (useParent) {
                 this.ports = this.args.pvtPorts = this.args.pvtParent.pvtPorts;
                 this.serverController.setPorts(this.ports);
@@ -438,6 +440,8 @@ export class GDBDebugSession extends LoggingDebugSession {
             }
             const totalPortsNeeded = this.calculatePortsNeeded();
             const portFinderOpts = { min: startPort, max: 52000, retrieve: totalPortsNeeded, consecutive: true };
+            //const portFinderOpts = { min: startPort, max: 5333, retrieve: totalPortsNeeded, consecutive: true }; //YX 20220513
+
             TcpPortScanner.findFreePorts(portFinderOpts, GDBServer.LOCALHOST).then((ports) => {
                 this.createPortsMap(ports);
                 this.serverController.setPorts(this.ports);
