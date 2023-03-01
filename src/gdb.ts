@@ -1,3 +1,9 @@
+//
+// When the new DAP spec is released
+// TODO:
+// * Update setDataBreakpoints to check for frame-id if the 'name' is an expression
+// * Return the new type of busy error for evaluate/memory-requests/disassembly and certain other responses
+//
 import {
     Logger, logger, LoggingDebugSession, InitializedEvent, TerminatedEvent,
     ContinuedEvent, OutputEvent, Thread, ThreadEvent,
@@ -9,7 +15,7 @@ import { extractBits, hexFormat } from './frontend/utils';
 import { Variable, VariableObject, MIError, OurDataBreakpoint, OurInstructionBreakpoint, OurSourceBreakpoint } from './backend/backend';
 import {
     TelemetryEvent, ConfigurationArguments, StoppedEvent, GDBServerController, SymbolFile,
-    createPortName, GenericCustomEvent, quoteShellCmdLine, toStringDecHexOctBin, ADAPTER_DEBUG_MODE, defSymbolFile
+    createPortName, GenericCustomEvent, quoteShellCmdLine, toStringDecHexOctBin, ADAPTER_DEBUG_MODE, defSymbolFile, CTIAction
 } from './common';
 import { GDBServer, ServerConsoleLog } from './backend/server';
 import { MINode } from './backend/mi_parse';
@@ -72,6 +78,7 @@ const REG_HANDLE_FINISH     = 0x02FFFF;
 const VAR_HANDLES_START     = 0x030000;
 
 function COMMAND_MAP(c: string): string {
+    if (!c) { return c; }
     c = c.trim();
     if (['continue', 'c', 'cont'].find((s) => s === c)) {
         // For some reason doing a continue in one of the commands from launch.json does not work with gdb when in MI mode
@@ -91,7 +98,7 @@ class CustomStoppedEvent extends Event implements DebugProtocol.Event {
 
     constructor(reason: string, threadID: number) {
         super('custom-stop', { reason: reason, threadID: threadID });
-        console.log(`${dbgResumeStopCounter} **** Stopped reason:${reason} thread:${threadID}`);
+        // console.log(`${dbgResumeStopCounter} **** Stopped reason:${reason} thread:${threadID}`);
         dbgResumeStopCounter++;
     }
 }
@@ -110,16 +117,15 @@ class VSCodeRequest<RespType, ArgsType> {
 }
 
 /*
-** There are some requests (setFunctionBreakpoints) where VSCode sends duplicate requests if the target is already running
-** and the second one comes in while the first one is running (still un-resolved) and ruins the sequence in many ways. To avoid this, we can
-** queue all such requests and guaranteed to execute the request one at a time.
+** There are breakpoint requests where VSCode sends duplicate or back to back requests. If the target is already running
+** and the second one comes in while the first one is running (still un-resolved) and ruins the sequence in many ways.
+** To avoid this, we can queue all such requests and guaranteed to execute the request one at a time in proper order
 **
 ** There is another request (evaluateRequest) that can also be messed up by back to back requests, which messes up in other
 ** ways. You can also have duplicates here because the user created such dups.
 **
-**
 ** For requests where gdb needs to be temporarily interrupted for the operation to succeed, use setFunctionBreakpoints as a template (carefully)
-** andfor others, use evaluateRequest as a template
+** and for others, use evaluateRequest as a template
 */
 class RequestQueue<RespType, ArgsType> {
     private queue: Array<VSCodeRequest<RespType, ArgsType>> = [];
@@ -164,7 +170,7 @@ class CustomContinuedEvent extends Event implements DebugProtocol.Event {
 
     constructor(threadID: number, allThreads: boolean = true) {
         super('custom-continued', { threadID: threadID, allThreads: allThreads });
-        console.log(`${dbgResumeStopCounter} **** Running thread:${threadID}`);
+        // console.log(`${dbgResumeStopCounter} **** Running thread:${threadID}`);
         dbgResumeStopCounter++;
     }
 }
@@ -227,12 +233,21 @@ export class GDBDebugSession extends LoggingDebugSession {
 
     protected suppressRadixMsgs = false;
 
+    protected tcpPortAllocatedListner = this.tcpPortsAllocated.bind(this);
+
     public constructor(debuggerLinesStartAt1: boolean, public readonly isServer: boolean = false, threadID: number = 1) {
         super(undefined, debuggerLinesStartAt1, isServer);     // Use if deriving from LogDebugSession
         // super(debuggerLinesStartAt1, isServer);  // Use if deriving from DebugSession
-        TcpPortScanner.PortAllocated.on('allocated', (ports) => {
-            this.sendEvent(new GenericCustomEvent('ports-allocated', ports));
-        });
+
+        // TcpPortScanner.PortAllocated.on('allocated', (ports) => {
+        //    this.sendEvent(new GenericCustomEvent('ports-allocated', ports));
+        // });
+        // While debugging, we are in server mode so these listners start piling up preventing addition of more listners
+        TcpPortScanner.PortAllocated.on('allocated', this.tcpPortAllocatedListner);
+    }
+
+    private tcpPortsAllocated(ports) {
+        this.sendEvent(new GenericCustomEvent('ports-allocated', ports));
     }
 
     // tslint:disable-next-line: max-line-length
@@ -276,6 +291,7 @@ export class GDBDebugSession extends LoggingDebugSession {
         response.body.supportsSteppingGranularity = true;
         response.body.supportsInstructionBreakpoints = true;
         response.body.supportsReadMemoryRequest = true;
+        response.body.supportsWriteMemoryRequest = true;
         this.sendResponse(response);
     }
 
@@ -296,7 +312,7 @@ export class GDBDebugSession extends LoggingDebugSession {
         this.args = this.normalizeArguments(args);
         this.handleMsg('stdout',
             `Cortex-Debug: VSCode debugger extension version ${args.pvtVersion} git(${__COMMIT_HASH__}). ` +
-            'Usaage info: https://github.com/Marus/cortex-debug#usage');
+            'Usage info: https://github.com/Marus/cortex-debug#usage');
 
         if (this.origShowDevDebugOutput === ADAPTER_DEBUG_MODE.VSCODE) {
             this.handleMsg('log', '"configuration": ' + JSON.stringify(args, undefined, 4) + '\n');
@@ -414,7 +430,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                 if (!path.isAbsolute(folder)) {
                     folder = path.join(args.cwd || process.cwd(), folder);
                 }
-                folder = path.normalize(folder).replace('\\', '/');
+                folder = path.normalize(folder).replace(/\\/g, '/');
                 while ((folder.length > 1) && folder.endsWith('/') && !folder.endsWith(':/')) {
                     folder = folder.substring(0, folder.length - 1);
                 }
@@ -428,8 +444,6 @@ export class GDBDebugSession extends LoggingDebugSession {
     private getTCPPorts(useParent): Thenable<void> {
         return new Promise((resolve, reject) => {
             const startPort = 50000;
-            //const startPort = 3333; //20220513
-
             if (useParent) {
                 this.ports = this.args.pvtPorts = this.args.pvtParent.pvtPorts;
                 this.serverController.setPorts(this.ports);
@@ -440,8 +454,6 @@ export class GDBDebugSession extends LoggingDebugSession {
             }
             const totalPortsNeeded = this.calculatePortsNeeded();
             const portFinderOpts = { min: startPort, max: 52000, retrieve: totalPortsNeeded, consecutive: true };
-            //const portFinderOpts = { min: startPort, max: 5333, retrieve: totalPortsNeeded, consecutive: true }; //YX 20220513
-
             TcpPortScanner.findFreePorts(portFinderOpts, GDBServer.LOCALHOST).then((ports) => {
                 this.createPortsMap(ports);
                 this.serverController.setPorts(this.ports);
@@ -461,11 +473,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                 }
             };
             if (!fs.existsSync(this.args.executable)) {
-                this.sendErrorResponse(
-                    response,
-                    103,
-                    `Unable to find executable file at ${this.args.executable}.`
-                );
+                this.sendErrorResponse(response, 103, `Unable to find executable file at ${this.args.executable}.`);
                 return doResolve();
             }
 
@@ -515,11 +523,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                         initMatch = new RegExp(this.args.overrideGDBServerStartedRegex, 'i');
                     }
                     if (consolePort === undefined) {
-                        this.launchErrorResponse(
-                            response,
-                            107,
-                            'GDB Server Console tcp port is undefined.'
-                        );
+                        this.launchErrorResponse(response, 107, 'GDB Server Console tcp port is undefined.');
                         return doResolve();
                     }
                 }
@@ -527,12 +531,14 @@ export class GDBDebugSession extends LoggingDebugSession {
                 this.server.on('exit', () => {
                     if (this.started) {
                         this.serverQuitEvent();
+                    } else if (!this.miDebugger.isRunning()) {
+                        this.launchErrorResponse(response, 103, 'GDB could not start as expected. Bad installation or version mismatch. '
+                            + 'See if you can start gdb from a shell prompt and check its version (Must be >= 9)');
+                        doResolve();
                     } else {
-                        this.launchErrorResponse(
-                            response,
-                            103,
-                            `${this.serverController?.name || this.args.servertype}: GDB Server Quit Unexpectedly. See gdb-server output for more details.`
-                        );
+                        const server = this.serverController?.name || this.args.servertype;
+                        const msg = `${server}: GDB Server Quit Unexpectedly. See gdb-server output in TERMINAL tab for more details.`;
+                        this.launchErrorResponse(response, 103, msg);
                         doResolve();
                     }
                 });
@@ -568,13 +574,13 @@ export class GDBDebugSession extends LoggingDebugSession {
                         const showTimes = this.args.showDevDebugOutput && this.args.showDevDebugTimestamps;
                         await gdbPromise;
                         if (showTimes) { this.handleMsg('log', 'Debug Time: GDB Ready...\n'); }
-                                          
+
                         // await gdbInfoVariables;
                         // if (showTimes) { this.handleMsg('log', 'Debug Time: GDB info variables done...\n'); }
 
                         await this.serverController.serverLaunchCompleted();
                         if (showTimes) { this.handleMsg('log', 'Debug Time: GDB Server post start events done...\n'); }
-                          
+
                         await symbolsPromise;
                         if (showTimes) { this.handleMsg('log', 'Debug Time: objdump and nm done...\n'); }
                         if (showTimes) { this.handleMsg('log', 'Debug Time: All pending items done, proceed to gdb connect...\n'); }
@@ -608,7 +614,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                         return doResolve();
                     }
 
-                    this.serverController.debuggerLaunchStarted();
+                    this.serverController.debuggerLaunchStarted(this);
                     this.miDebugger.once('debug-ready', () => {
                         this.debugReady = true;
                         this.attached = attach;
@@ -706,7 +712,7 @@ export class GDBDebugSession extends LoggingDebugSession {
         } else if (this.args.servertype === 'stlink') {
             serverCwd = path.dirname(serverExe) || '.';
             if (serverCwd !== '.') {
-                this.handleMsg('log', `Setting GDB-SErver CWD: ${serverCwd}\n`);
+                this.handleMsg('log', `Setting GDB-Server CWD: ${serverCwd}\n`);
             }
         }
         return serverCwd;
@@ -727,7 +733,6 @@ export class GDBDebugSession extends LoggingDebugSession {
 
     private startComplete(mode: SessionMode, sendStoppedEvents = true) {
         this.disableSendStoppedEvents = false;
-        this.pendingBkptResponse = false;
         this.continuing = false;
         this.stopped = this.miDebugger.status !== 'running';        // Set to real status
         if (sendStoppedEvents && !this.args.noDebug && this.stopped) {
@@ -794,7 +799,7 @@ export class GDBDebugSession extends LoggingDebugSession {
         }
         const gdbMissingMsg = `GDB executable "${gdbExePath}" was not found.\n` +
             'Please configure "cortex-debug.armToolchainPath" or "cortex-debug.gdbPath" correctly.';
-        
+
         if (this.args.gdbPath) {
             gdbExePath = this.args.gdbPath;
         } else if (path.isAbsolute(gdbExePath)) {
@@ -803,7 +808,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                 return null;
             }
         }
-        else if (!hasbin.sync(gdbExePath.replace('.exe', ''))) {
+        else if (!hasbin.sync(gdbExePath.replace(/\.exe$/i, ''))) {
             this.launchErrorResponse(response, 103, gdbMissingMsg);
             return null;
         }
@@ -1044,16 +1049,16 @@ export class GDBDebugSession extends LoggingDebugSession {
                 this.disassember.customDisassembleRequest(response, args);
                 break;
             case 'execute-command':
-                let cmd = args['command'] as string;
-                if (cmd.startsWith('-')) { cmd = cmd.substring(1); }
-                else { cmd = `interpreter-exec console "${cmd}"`; }
-                this.miDebugger.sendCommand(cmd).then((node) => {
-                    response.body = node.resultRecords;
-                    this.sendResponse(response);
-                }, (error) => {
-                    response.body = error;
-                    this.sendErrorResponse(response, 110, 'Unable to execute command');
-                });
+                const cmd = COMMAND_MAP(args?.command as string);
+                if (cmd) {
+                    this.miDebugger.sendCommand(cmd).then((node) => {
+                        response.body = node.resultRecords;
+                        this.sendResponse(response);
+                    }, (error) => {
+                        response.body = error;
+                        this.sendErrorResponse(response, 110, 'Unable to execute command');
+                    });
+                }
                 break;
             case 'reset-device':
                 this.resetDevice(response, args);
@@ -1067,6 +1072,12 @@ export class GDBDebugSession extends LoggingDebugSession {
                 this.emit('children-terminating');
                 this.sendResponse(response);
                 break;
+            case 'rtt-poll': {
+                if (this.serverController.rttPoll) {
+                    this.serverController.rttPoll();
+                }
+                break;
+            }
             default:
                 response.body = { error: 'Invalid command.' };
                 this.sendResponse(response);
@@ -1109,6 +1120,10 @@ export class GDBDebugSession extends LoggingDebugSession {
     }
 
     protected readMemoryRequest(response: DebugProtocol.ReadMemoryResponse, args: DebugProtocol.ReadMemoryArguments, request?: DebugProtocol.Request): void {
+        if (this.isBusy()) {
+            this.busyError(response, args);
+            return;
+        }
         const startAddress = parseInt(args.memoryReference);
         const length = args.count;
         const useAddr = hexFormat(startAddress + (args.offset || 0));
@@ -1139,6 +1154,29 @@ export class GDBDebugSession extends LoggingDebugSession {
         }, (error) => {
             this.sendErrorResponse(response, 114, `Read memory error: ${error.toString()}`);
             this.sendEvent(new TelemetryEvent('Error', 'Reading Memory', command));
+        });
+    }
+
+    protected writeMemoryRequest(response: DebugProtocol.WriteMemoryResponse, args: DebugProtocol.WriteMemoryArguments, request?: DebugProtocol.Request): void {
+        if (this.isBusy()) {
+            this.busyError(response, args);
+            return;
+        }
+        const startAddress = parseInt(args.memoryReference);
+        const useAddr = hexFormat(startAddress + (args.offset || 0));
+        const buf = Buffer.from(args.data, 'base64');
+        const data = buf.toString('hex');
+
+        // Note: We don't do partials
+        this.miDebugger.sendCommand(`data-write-memory-bytes ${useAddr} ${data}`).then((node) => {
+            response.body = {
+                bytesWritten: buf.length
+            };
+            this.sendResponse(response);
+        }, (error) => {
+            (response as DebugProtocol.Response).body = { error: error };
+            this.sendErrorResponse(response, 114, `Write memory error: ${error.toString()}`);
+            this.sendEvent(new TelemetryEvent('Error', 'Writing Memory', `${startAddress.toString(16)}-${data.length.toString(16)}`));
         });
     }
 
@@ -1289,6 +1327,7 @@ export class GDBDebugSession extends LoggingDebugSession {
 
     protected disconnectingPromise: Promise<void> = undefined;
     protected async disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments): Promise<void> {
+        TcpPortScanner.PortAllocated.removeListener('allocated', this.tcpPortAllocatedListner);
         if (this.disconnectingPromise) {
             // One of the ways this happens when we have the following
             // * we are a child session of someone else
@@ -1406,11 +1445,20 @@ export class GDBDebugSession extends LoggingDebugSession {
                 this.disableSendStoppedEvents = false;
                 this.continuing = false;
 
-                commands.push(...this.args.preRestartCommands.map(COMMAND_MAP));
-                const restartCommands = this.args.overrideRestartCommands != null ?
-                    this.args.overrideRestartCommands.map(COMMAND_MAP) : this.serverController.restartCommands();
-                commands.push(...restartCommands);
-                commands.push(...this.args.postRestartCommands.map(COMMAND_MAP));
+                if (mode === SessionMode.RESTART) {
+                    commands.push(...this.args.preRestartCommands.map(COMMAND_MAP));
+                    const restartCommands = this.args.overrideRestartCommands ?
+                        this.args.overrideRestartCommands.map(COMMAND_MAP) : this.serverController.restartCommands();
+                    commands.push(...restartCommands);
+                    commands.push(...this.args.postRestartCommands.map(COMMAND_MAP));
+                } else {
+                    commands.push(...this.args.preResetCommands.map(COMMAND_MAP));
+                    const resetCommands = this.args.overrideResetCommands ? this.args.overrideResetCommands.map(COMMAND_MAP) :
+                                          this.args.overrideRestartCommands ? this.args.overrideRestartCommands.map(COMMAND_MAP) :
+                                          this.serverController.restartCommands();
+                    commands.push(...resetCommands);
+                    commands.push(...this.args.postResetCommands.map(COMMAND_MAP));
+                }
 
                 let finishCalled = false;
                 const callFinish = () => {
@@ -1461,10 +1509,9 @@ export class GDBDebugSession extends LoggingDebugSession {
     }
 
     protected getResetCommands(): string[] {
-        if (this.args.overrideRestartCommands != null) {
-            return this.args.overrideRestartCommands.map(COMMAND_MAP);
-        }
-        return this.serverController.restartCommands();
+        return this.args.overrideResetCommands != null ? this.args.overrideResetCommands.map(COMMAND_MAP) :
+               this.args.overrideRestartCommands != null ? this.args.overrideRestartCommands.map(COMMAND_MAP) :
+               this.serverController.restartCommands();
     }
 
     protected async resetDevice(response: DebugProtocol.Response, args: any) {
@@ -1520,7 +1567,7 @@ export class GDBDebugSession extends LoggingDebugSession {
         // Should we call exec-interrupt here? See #561
         // Once we get this, from here on, nothing really works with gdb.
         const msg = 'Error: A serious error occurred with gdb, unable to continue or interrupt We may not be able to recover ' +
-           'from this point. You can try continuing or ending session. Must address root cause though';
+            'from this point. You can try continuing or ending session. Must address root cause though';
         this.sendEvent(new GenericCustomEvent('popup', {type: 'error', message: msg}));
         this.handleMsg('stderr', msg + '\n');
         this.continuing = false;
@@ -1695,10 +1742,13 @@ export class GDBDebugSession extends LoggingDebugSession {
         }
     }
 
-    protected quitEvent() {
+    protected quitEvent(type?: string, msg?: string) {
         this.quit = true;
         if (traceThreads) {
             this.handleMsg('log', '**** quit event\n');
+        }
+        if (msg && type) {
+            this.handleMsg(type, msg);
         }
         if (this.server && this.server.isProcessRunning()) {
             // A gdb quit may be happening with VSCode asking us to finish or a crash or user doing something
@@ -1772,21 +1822,25 @@ export class GDBDebugSession extends LoggingDebugSession {
         }
     }
 
-    private functionBreakPointsQ = new RequestQueue<DebugProtocol.SetFunctionBreakpointsResponse, DebugProtocol.SetFunctionBreakpointsArguments>();
+    // These should really by multiple pairs that are unique so you cannot mix up
+    // the response and args
+    private allBreakPointsQ = new RequestQueue<
+        DebugProtocol.SetFunctionBreakpointsResponse |
+        DebugProtocol.SetBreakpointsResponse |
+        DebugProtocol.SetInstructionBreakpointsResponse |
+        DebugProtocol.SetDataBreakpointsResponse,
+        DebugProtocol.SetFunctionBreakpointsArguments |
+        DebugProtocol.SetBreakpointsArguments |
+        DebugProtocol.SetInstructionBreakpointsArguments |
+        DebugProtocol.SetDataBreakpointsArguments>();
     protected setFunctionBreakPointsRequest(
         r: DebugProtocol.SetFunctionBreakpointsResponse,
         a: DebugProtocol.SetFunctionBreakpointsArguments): Promise<void> {
         const doit = (
             response: DebugProtocol.SetFunctionBreakpointsResponse,
             args: DebugProtocol.SetFunctionBreakpointsArguments,
-            pendContinue: PendingContinue
-        ): Promise<void> => {
+            pendContinue: PendingContinue): Promise<void> => {
             return new Promise(async (resolve) => {
-                if ((args.breakpoints.length === 0) && (this.functionBreakpoints.length === 0)) {
-                    this.sendResponse(response);
-                    resolve();
-                    return;
-                }
                 const createBreakpoints = async () => {
                     try {
                         await this.miDebugger.removeBreakpoints(this.functionBreakpoints);
@@ -1841,244 +1895,212 @@ export class GDBDebugSession extends LoggingDebugSession {
                         this.sendErrorResponse(response, 10, msg.toString());
                     }
 
-                    if (pendContinue.haveMore()) {
-                        // do not sendContinue even if we were supposed to
-                        console.log('Yup got another request while we are processing one. VSCode issue\n');
-                    } else if (pendContinue.shouldContinue) {
-                        this.disableSendStoppedEvents = false;
-                        pendContinue.shouldContinue = false;
-                        this.sendContinue();
-                    }
+                    this.continueIfNoMore(pendContinue);
                     resolve();
                 };
 
-                if (this.miDebugger.status !== 'running') {         // May not even have started just yet
-                    await createBreakpoints();
-                } else {
-                    this.disableSendStoppedEvents = true;
-                    pendContinue.shouldContinue = true;
-                    this.miDebugger.once('generic-stopped', () => { createBreakpoints(); });
-                    this.miDebugger.sendCommand('exec-interrupt');
-                }
+                await this.doPauseExecContinue(createBreakpoints, pendContinue);
             });
         };
 
-        return this.functionBreakPointsQ.add(doit, r, a);
+        return this.allBreakPointsQ.add(doit, r, a);
     }
 
-    protected pendingBkptResponse = false;
-    protected setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): Promise<void> {
-        return new Promise(async (resolve) => {
-            if ((args.breakpoints.length === 0) && (this.breakpointMap.size === 0)) {
-                this.sendResponse(response);
-                resolve();
-                return;
-            }
-            const savedFlag = this.disableSendStoppedEvents;
-            const createBreakpoints = async (shouldContinue) => {
-                const currentBreakpoints = (this.breakpointMap.get(args.source.path) || []).map((bp) => bp.number);
+    private continueIfNoMore(pendContinue: PendingContinue) {
+        if (pendContinue.haveMore()) {
+        } else if (pendContinue.shouldContinue) {
+            this.disableSendStoppedEvents = false;
+            pendContinue.shouldContinue = false;
+            this.sendContinue();
+        }
+    }
 
-                try {
-                    this.disableSendStoppedEvents = savedFlag;
-                    await this.miDebugger.removeBreakpoints(currentBreakpoints);
-                    for (const old of currentBreakpoints) {
-                        this.breakpointById.delete(old);
-                    }
-                    this.breakpointMap.set(args.source.path, []);
+    private async doPauseExecContinue(createBreakpoints: () => Promise<void>, pendContinue: PendingContinue) {
+        if (this.miDebugger.status !== 'running') { // May not even have started just yet
+            await createBreakpoints();
+        } else {
+            this.disableSendStoppedEvents = true;
+            pendContinue.shouldContinue = true;
+            this.miDebugger.once('generic-stopped', () => { createBreakpoints(); });
+            this.miDebugger.sendCommand('exec-interrupt');
+        }
+    }
 
-                    const all: Array<Promise<OurSourceBreakpoint | MIError>> = [];
-                    const sourcepath = decodeURIComponent(args.source.path);
+    protected setBreakPointsRequest(
+        r: DebugProtocol.SetBreakpointsResponse,
+        a: DebugProtocol.SetBreakpointsArguments): Promise<void> {
+        const doit = (
+            response: DebugProtocol.SetBreakpointsResponse,
+            args: DebugProtocol.SetBreakpointsArguments,
+            pendContinue: PendingContinue): Promise<void> => {
+            return new Promise(async (resolve) => {
+                const createBreakpoints = async () => {
+                    const currentBreakpoints = (this.breakpointMap.get(args.source.path) || []).map((bp) => bp.number);
 
-                    if (sourcepath.startsWith('disassembly:/')) {
-                        let sidx = 13;
-                        if (sourcepath.startsWith('disassembly:///')) { sidx = 15; }
-                        const path = sourcepath.substring(sidx, sourcepath.length - 6); // Account for protocol and extension
-                        const parts = path.split(':::');
-                        let func: string;
-                        let file: string;
-
-                        if (parts.length === 2) {
-                            func = parts[1];
-                            file = parts[0];
+                    try {
+                        await this.miDebugger.removeBreakpoints(currentBreakpoints);
+                        for (const old of currentBreakpoints) {
+                            this.breakpointById.delete(old);
                         }
-                        else {
-                            func = parts[0];
-                        }
+                        this.breakpointMap.set(args.source.path, []);
 
-                        const symbol: SymbolInformation = await this.disassember.getDisassemblyForFunction(func, file);
+                        const all: Array<Promise<OurSourceBreakpoint | MIError>> = [];
+                        const sourcepath = decodeURIComponent(args.source.path);
 
-                        if (symbol) {
-                            args.breakpoints.forEach((brk) => {
-                                if (brk.line <= symbol.instructions.length) {
-                                    const line = symbol.instructions[brk.line - 1];
-                                    const arg: OurSourceBreakpoint = {
-                                        ...brk,
-                                        file: args.source.path,
-                                        raw: line.address
-                                    };
-                                    all.push(this.miDebugger.addBreakPoint(arg).catch((err: MIError) => err));
-                                } else {
-                                    all.push(
-                                        Promise.resolve(
-                                            new MIError(
-                                                `${func} only contains ${symbol.instructions.length} instructions`,
-                                                'Set breakpoint'
-                                            )
-                                        )
-                                    );
-                                }
-                            });
-                        }
-                    }
-                    else {
-                        args.breakpoints.forEach((brk) => {
-                            const arg: OurSourceBreakpoint = {
-                                ...brk,
-                                file: args.source.path
-                            };
-                            all.push(this.miDebugger.addBreakPoint(arg).catch((err: MIError) => err));
-                        });
-                    }
+                        if (sourcepath.startsWith('disassembly:/')) {
+                            let sidx = 13;
+                            if (sourcepath.startsWith('disassembly:///')) { sidx = 15; }
+                            const path = sourcepath.substring(sidx, sourcepath.length - 6); // Account for protocol and extension
+                            const parts = path.split(':::');
+                            let func: string;
+                            let file: string;
 
-                    const brkpoints = await Promise.all(all);
-
-                    response.body = {
-                        breakpoints: brkpoints.map((bp) => {
-                            if (bp instanceof MIError) {
-                                /* Failed breakpoints should be reported with
-                                 * verified: false, so they can be greyed out
-                                 * in the UI. The attached message will be
-                                 * presented as a tooltip.
-                                 */
-                                return {
-                                    verified: false,
-                                    message: bp.message
-                                } as DebugProtocol.Breakpoint;
+                            if (parts.length === 2) {
+                                func = parts[1];
+                                file = parts[0];
+                            }
+                            else {
+                                func = parts[0];
                             }
 
-                            return {
-                                line: bp.line,
-                                id: bp.number,
-                                instructionReference: bp.address,
-                                verified: true
-                            };
-                        })
-                    };
+                            const symbol: SymbolInformation = await this.disassember.getDisassemblyForFunction(func, file);
 
-                    const bpts: OurSourceBreakpoint[] = brkpoints.filter((bp) => !(bp instanceof MIError)) as OurSourceBreakpoint[];
-                    for (const bpt of bpts) {
-                        this.breakpointById.set(bpt.number, bpt);
+                            if (symbol) {
+                                args.breakpoints.forEach((brk) => {
+                                    if (brk.line <= symbol.instructions.length) {
+                                        const line = symbol.instructions[brk.line - 1];
+                                        const arg: OurSourceBreakpoint = {
+                                            ...brk,
+                                            file: args.source.path,
+                                            raw: line.address
+                                        };
+                                        all.push(this.miDebugger.addBreakPoint(arg).catch((err: MIError) => err));
+                                    } else {
+                                        all.push(
+                                            Promise.resolve(
+                                                new MIError(
+                                                    `${func} only contains ${symbol.instructions.length} instructions`,
+                                                    'Set breakpoint'
+                                                )
+                                            )
+                                        );
+                                    }
+                                });
+                            }
+                        }
+                        else {
+                            args.breakpoints.forEach((brk) => {
+                                const arg: OurSourceBreakpoint = {
+                                    ...brk,
+                                    file: args.source.path
+                                };
+                                all.push(this.miDebugger.addBreakPoint(arg).catch((err: MIError) => err));
+                            });
+                        }
+
+                        const brkpoints = await Promise.all(all);
+
+                        response.body = {
+                            breakpoints: brkpoints.map((bp) => {
+                                if (bp instanceof MIError) {
+                                    /* Failed breakpoints should be reported with
+                                     * verified: false, so they can be greyed out
+                                     * in the UI. The attached message will be
+                                     * presented as a tooltip.
+                                     */
+                                    return {
+                                        verified: false,
+                                        message: bp.message
+                                    } as DebugProtocol.Breakpoint;
+                                }
+
+                                return {
+                                    line: bp.line,
+                                    id: bp.number,
+                                    instructionReference: bp.address,
+                                    verified: true
+                                };
+                            })
+                        };
+
+                        const bpts: OurSourceBreakpoint[] = brkpoints.filter((bp) => !(bp instanceof MIError)) as OurSourceBreakpoint[];
+                        for (const bpt of bpts) {
+                            this.breakpointById.set(bpt.number, bpt);
+                        }
+                        this.breakpointMap.set(args.source.path, bpts);
+                        this.sendResponse(response);
                     }
-                    this.breakpointMap.set(args.source.path, bpts);
-                    this.sendResponse(response);
-                    this.pendingBkptResponse = false;
-                }
-                catch (msg) {
-                    this.sendErrorResponse(response, 9, msg.toString());
-                    this.pendingBkptResponse = false;
-                }
+                    catch (msg) {
+                        this.sendErrorResponse(response, 9, msg.toString());
+                    }
 
-                resolve();
-                if (shouldContinue) {
-                    this.sendContinue();
-                }
-            };
+                    this.continueIfNoMore(pendContinue);
+                    resolve();
+                };
 
-            const process = async () => {
-                if (this.miDebugger.status !== 'running') {         // May not even have started just yet
-                    createBreakpoints(false);
-                }
-                else {
-                    this.disableSendStoppedEvents = true;
-                    this.miDebugger.once('generic-stopped', () => { createBreakpoints(true); });
-                    this.miDebugger.sendCommand('exec-interrupt');
-                }
-            };
+                await this.doPauseExecContinue(createBreakpoints, pendContinue);
+            });
+        };
 
-            // Following will look crazy. VSCode will make this request before we have even finished
-            // the last one and without any user interaction either. To reproduce the problem,
-            // see https://github.com/Marus/cortex-debug/issues/525
-            // It happens with duplicate breakpoints created by the user and one of them is deleted
-            // VSCode will delete the first one and then delete the other one too but in a separate
-            // call
-            const intervalTime = 1;
-            const to = setInterval(() => {
-                if (!this.pendingBkptResponse) {
-                    clearInterval(to);
-                    this.pendingBkptResponse = true;
-                    process();
-                }
-            }, intervalTime);
-        });
+        return this.allBreakPointsQ.add(doit, r, a);
     }
 
     protected setInstructionBreakpointsRequest(
-        response: DebugProtocol.SetInstructionBreakpointsResponse,
-        args: DebugProtocol.SetInstructionBreakpointsArguments, request?: DebugProtocol.Request): Promise<void> {
-        return new Promise<void>(async (resolve) => {
-            if ((args.breakpoints.length === 0) && (this.instrBreakpointMap.size === 0)) {
-                this.sendResponse(response);
-                resolve();
-                return;
-            }
-            const savedFlag = this.disableSendStoppedEvents;
-            const createBreakpoints = async (shouldContinue) => {
-                try {
-                    const currentBreakpoints = Array.from(this.instrBreakpointMap.keys());
-                    this.instrBreakpointMap.clear();
+        r: DebugProtocol.SetInstructionBreakpointsResponse,
+        a: DebugProtocol.SetInstructionBreakpointsArguments, request?: DebugProtocol.Request): Promise<void> {
+        const doit = (
+            response: DebugProtocol.SetInstructionBreakpointsResponse,
+            args: DebugProtocol.SetInstructionBreakpointsArguments,
+            pendContinue: PendingContinue): Promise<void> => {
+            return new Promise<void>(async (resolve) => {
+                const createBreakpoints = async () => {
+                    try {
+                        const currentBreakpoints = Array.from(this.instrBreakpointMap.keys());
+                        this.instrBreakpointMap.clear();
 
-                    this.disableSendStoppedEvents = savedFlag;
-                    await this.miDebugger.removeBreakpoints(currentBreakpoints);
+                        await this.miDebugger.removeBreakpoints(currentBreakpoints);
 
-                    const all: Array<Promise<OurInstructionBreakpoint | MIError>> = [];
-                    args.breakpoints.forEach((brk) => {
-                        const addr = parseInt(brk.instructionReference) + brk.offset || 0;
-                        const bpt: OurInstructionBreakpoint = { ...brk, number: -1, address: addr };
-                        all.push(this.miDebugger.addInstrBreakPoint(bpt).catch((err: MIError) => err));
-                    });
+                        const all: Array<Promise<OurInstructionBreakpoint | MIError>> = [];
+                        args.breakpoints.forEach((brk) => {
+                            const addr = parseInt(brk.instructionReference) + brk.offset || 0;
+                            const bpt: OurInstructionBreakpoint = { ...brk, number: -1, address: addr };
+                            all.push(this.miDebugger.addInstrBreakPoint(bpt).catch((err: MIError) => err));
+                        });
 
-                    const brkpoints = await Promise.all(all);
+                        const brkpoints = await Promise.all(all);
 
-                    response.body = {
-                        breakpoints: brkpoints.map((bp) => {
-                            if (bp instanceof MIError) {
+                        response.body = {
+                            breakpoints: brkpoints.map((bp) => {
+                                if (bp instanceof MIError) {
+                                    return {
+                                        verified: false,
+                                        message: bp.message
+                                    } as DebugProtocol.Breakpoint;
+                                }
+
+                                this.instrBreakpointMap.set(bp.number, bp);
                                 return {
-                                    verified: false,
-                                    message: bp.message
-                                } as DebugProtocol.Breakpoint;
-                            }
+                                    id: bp.number,
+                                    verified: true
+                                };
+                            })
+                        };
 
-                            this.instrBreakpointMap.set(bp.number, bp);
-                            return {
-                                id: bp.number,
-                                verified: true
-                            };
-                        })
-                    };
+                        this.sendResponse(response);
+                    }
+                    catch (msg) {
+                        this.sendErrorResponse(response, 9, msg.toString());
+                    }
 
-                    this.sendResponse(response);
-                    this.pendingBkptResponse = false;
-                }
-                catch (msg) {
-                    this.sendErrorResponse(response, 9, msg.toString());
-                    this.pendingBkptResponse = false;
-                }
+                    this.continueIfNoMore(pendContinue);
+                    resolve();
+                };
 
-                resolve();
-                if (shouldContinue) {
-                    this.sendContinue();
-                }
-            };
+                await this.doPauseExecContinue(createBreakpoints, pendContinue);
+            });
+        };
 
-            if (this.miDebugger.status !== 'running') {         // May not even have started just yet
-                createBreakpoints(false);
-            }
-            else {
-                this.disableSendStoppedEvents = true;
-                this.miDebugger.once('generic-stopped', () => { createBreakpoints(true); });
-                this.miDebugger.sendCommand('exec-interrupt');
-            }
-        });
+        return this.allBreakPointsQ.add(doit, r, a);
     }
 
     protected isVarRefGlobalOrStatic(varRef: number, id: any) {
@@ -2124,76 +2146,66 @@ export class GDBDebugSession extends LoggingDebugSession {
     }
 
     protected setDataBreakpointsRequest(
-        response: DebugProtocol.SetDataBreakpointsResponse,
-        args: DebugProtocol.SetDataBreakpointsArguments): Promise<void>
-    {
-        return new Promise<void>((resolve) => {
-            if ((args.breakpoints.length === 0) && (this.dataBreakpointMap.size === 0)) {
-                this.sendResponse(response);
-                resolve();
-                return;
-            }
-            const savedFlag = this.disableSendStoppedEvents;
-            const createBreakpoints = async (shouldContinue) => {
-                try {
-                    const currentBreakpoints = Array.from(this.dataBreakpointMap.keys());
-                    this.dataBreakpointMap.clear();
+        r: DebugProtocol.SetDataBreakpointsResponse,
+        a: DebugProtocol.SetDataBreakpointsArguments): Promise<void> {
+        const doit = (
+            response: DebugProtocol.SetDataBreakpointsResponse,
+            args: DebugProtocol.SetDataBreakpointsArguments,
+            pendContinue: PendingContinue): Promise<void> => {
+            return new Promise<void>(async (resolve) => {
+                const createBreakpoints = async () => {
+                    try {
+                        const currentBreakpoints = Array.from(this.dataBreakpointMap.keys());
+                        this.dataBreakpointMap.clear();
 
-                    this.disableSendStoppedEvents = savedFlag;
-                    await this.miDebugger.removeBreakpoints(currentBreakpoints);
+                        await this.miDebugger.removeBreakpoints(currentBreakpoints);
 
-                    const all: Array<Promise<OurDataBreakpoint | MIError>> = [];
+                        const all: Array<Promise<OurDataBreakpoint | MIError>> = [];
 
-                    args.breakpoints.forEach((brk) => {
-                        const bkp: OurDataBreakpoint = { ...brk };
-                        all.push(this.miDebugger.addDataBreakPoint(bkp).catch((err: MIError) => err));
-                    });
+                        args.breakpoints.forEach((brk) => {
+                            const bkp: OurDataBreakpoint = { ...brk };
+                            all.push(this.miDebugger.addDataBreakPoint(bkp).catch((err: MIError) => err));
+                        });
 
-                    const brkpoints = await Promise.all(all);
+                        const brkpoints = await Promise.all(all);
 
-                    response.body = {
-                        breakpoints: brkpoints.map((bp) => {
-                            if (bp instanceof MIError) {
-                                /* Failed breakpoints should be reported with
-                                 * verified: false, so they can be greyed out
-                                 * in the UI. The attached message will be
-                                 * presented as a tooltip.
-                                 */
+                        response.body = {
+                            breakpoints: brkpoints.map((bp) => {
+                                if (bp instanceof MIError) {
+                                    /* Failed breakpoints should be reported with
+                                     * verified: false, so they can be greyed out
+                                     * in the UI. The attached message will be
+                                     * presented as a tooltip.
+                                     */
+                                    return {
+                                        verified: false,
+                                        message: bp.message
+                                    } as DebugProtocol.Breakpoint;
+                                }
+
+                                this.dataBreakpointMap.set(bp.number, bp);
                                 return {
-                                    verified: false,
-                                    message: bp.message
-                                } as DebugProtocol.Breakpoint;
-                            }
+                                    id: bp.number,
+                                    verified: true
+                                };
+                            })
+                        };
 
-                            this.dataBreakpointMap.set(bp.number, bp);
-                            return {
-                                id: bp.number,
-                                verified: true
-                            };
-                        })
-                    };
+                        this.sendResponse(response);
+                    }
+                    catch (msg) {
+                        this.sendErrorResponse(response, 9, msg.toString());
+                    }
 
-                    this.sendResponse(response);
-                }
-                catch (msg) {
-                    this.sendErrorResponse(response, 9, msg.toString());
-                }
+                    this.continueIfNoMore(pendContinue);
+                    resolve();
+                };
 
-                resolve();
-                if (shouldContinue) {
-                    this.sendContinue();
-                }
-            };
+                await this.doPauseExecContinue(createBreakpoints, pendContinue);
+            });
+        };
 
-            if (this.miDebugger.status !== 'running') {         // May not even have started just yet
-                createBreakpoints(false);
-            }
-            else {
-                this.disableSendStoppedEvents = true;
-                this.miDebugger.once('generic-stopped', () => { createBreakpoints(true); });
-                this.miDebugger.sendCommand('exec-interrupt');
-            }
-        });
+        return this.allBreakPointsQ.add(doit, r, a);
     }
 
     protected threadsRequest(response: DebugProtocol.ThreadsResponse): Promise<void> {
@@ -2314,6 +2326,9 @@ export class GDBDebugSession extends LoggingDebugSession {
             stackFrames: [],
             totalFrames: 0
         };
+        // Handle optional args when not passed
+        args.startFrame = args.startFrame ?? 0;
+        args.levels = args.levels ?? Infinity;
         if (!this.isMIStatusStopped() || !this.stopped || this.disableSendStoppedEvents || this.continuing) {
             this.sendResponse(response);
             return Promise.resolve();
@@ -2748,7 +2763,7 @@ export class GDBDebugSession extends LoggingDebugSession {
         const variables: DebugProtocol.Variable[] = [];
         let stack: Variable[];
         try {
-            this.miDebugger.sendCommand(`stack-select-frame --thread ${threadId} ${frameId}`);
+            await this.miDebugger.sendCommand(`stack-select-frame --thread ${threadId} ${frameId}`);
             stack = await this.miDebugger.getStackVariables(threadId, frameId);
             for (const variable of stack) {
                 try {
@@ -3003,7 +3018,11 @@ export class GDBDebugSession extends LoggingDebugSession {
 
     protected async pauseRequest(response: DebugProtocol.PauseResponse, args: DebugProtocol.PauseArguments): Promise<void> {
         try {
-            const done = await this.miDebugger.interrupt();
+            if (this.args.ctiOpenOCDConfig?.enabled && this.args.ctiOpenOCDConfig?.pauseCommands && this.serverController.ctiStopResume) {
+                this.serverController.ctiStopResume(CTIAction.pause);
+            } else {
+                const done = await this.miDebugger.interrupt();
+            }
             this.sendResponse(response);
         }
         catch (msg) {
@@ -3013,7 +3032,11 @@ export class GDBDebugSession extends LoggingDebugSession {
 
     protected async continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): Promise<void> {
         try {
-            const done = await this.miDebugger.continue(args.threadId);
+            if (this.args.ctiOpenOCDConfig?.enabled && this.args.ctiOpenOCDConfig?.resumeCommands && this.serverController.ctiStopResume) {
+                this.serverController.ctiStopResume(CTIAction.resume);
+            } else {
+                const done = await this.miDebugger.continue(args.threadId);
+            }
             response.body = { allThreadsContinued: true };
             this.sendResponse(response);
         }
@@ -3114,30 +3137,31 @@ export class GDBDebugSession extends LoggingDebugSession {
         return ret;
     }
 
+    public isBusy() {
+        return !this.stopped || this.continuing || (this.miDebugger.status === 'running') || this.sendDummyStackTrace;
+    }
+
+    public busyError(response: DebugProtocol.Response, args: any) {
+        if (this.args.showDevDebugOutput) {
+            this.handleMsg('log', `Info: Received ${response.command} request while busy. ${JSON.stringify(args)}\n`);
+        }
+        response.message = 'notStopped';
+        this.sendErrorResponse(response, 8, 'Busy', undefined, ErrorDestination.Telemetry);
+    }
+
     private evaluateQ = new RequestQueue<DebugProtocol.EvaluateResponse, DebugProtocol.EvaluateArguments>();
     protected evaluateRequest(r: DebugProtocol.EvaluateResponse, a: DebugProtocol.EvaluateArguments): Promise<void> {
-        const isBusy = () => {
-            return !this.stopped || this.continuing || (this.miDebugger.status === 'running') || this.sendDummyStackTrace;
-        };
-
-        const busyError = (response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments) => {
-            if (this.args.showDevDebugOutput) {
-                this.handleMsg('log', `Info: Attempt to evalute expression while busy. ${JSON.stringify(args)}\n`);
-            }
-            this.sendErrorResponse(response, 8, 'Busy', undefined, ErrorDestination.Telemetry);
-        };
-
         if (a.context !== 'repl') {
-            if (isBusy()) {
-                busyError(r, a);
+            if (this.isBusy()) {
+                this.busyError(r, a);
                 return Promise.resolve();
             }
         }
 
         const doit = (response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments) => {
             return new Promise<void>(async (resolve) => {
-                if (isBusy()) {
-                    busyError(response, args);
+                if (this.isBusy() && (a.context !== 'repl')) {
+                    this.busyError(response, args);
                     resolve();
                     return;
                 }
@@ -3163,17 +3187,11 @@ export class GDBDebugSession extends LoggingDebugSession {
                 };
 
                 // Spec says if 'frameId' is specified, evaluate in the scope specified or in the global scope. Well,
-                // we don't have a way to specify global scope ... use current thread then.
-                let threadId = this.currentThreadId;
+                // we don't have a way to specify global scope ... use floating variable.
+                let threadId = this.stoppedThreadId || 1;
                 let frameId = 0;
-                if (args.frameId) {     // Should always be valid
+                if (args.frameId !== undefined) {     // Should always be valid
                     [threadId, frameId] = GDBDebugSession.decodeReference(args.frameId);
-                    if (traceThreads) {
-                        this.handleMsg('log', `**** evaluateRequest: ${args.context} '${args.expression}' in thread#${threadId} frame#${frameId}\n`);
-                    }
-                } else if (!isBusy()) {
-                    // In practice, never seen this unless it comes from a custom request
-                    this.handleMsg('log', `Thread Warning: ${args.context}: eval. expression '${args.expression}' with no thread context. Using default\n`);
                 }
 
                 if (args.context !== 'repl') {
@@ -3181,6 +3199,9 @@ export class GDBDebugSession extends LoggingDebugSession {
                         const exp = args.expression;
                         const hasher = crypto.createHash('sha256');
                         hasher.update(exp);
+                        if (args.frameId !== undefined) {
+                            hasher.update(args.frameId.toString(16));
+                        }
                         const exprName = hasher.digest('hex');
                         const varObjName = `${args.context}_${exprName}`;
                         let varObj: VariableObject;
@@ -3197,8 +3218,12 @@ export class GDBDebugSession extends LoggingDebugSession {
                             varObj = this.variableHandles.get(varId) as any;
                         }
                         catch (err) {
-                            if (!isBusy() && (err instanceof MIError && err.message === 'Variable object not found')) {
-                                varObj = await this.miDebugger.varCreate(0, exp, varObjName, '@');  // Create floating variable
+                            if (!this.isBusy() && (err instanceof MIError && err.message === 'Variable object not found')) {
+                                if (args.frameId === undefined) {
+                                    varObj = await this.miDebugger.varCreate(0, exp, varObjName, '@');  // Create floating variable
+                                } else {
+                                    varObj = await this.miDebugger.varCreate(0, exp, varObjName, '*', threadId, frameId);
+                                }
                                 const varId = findOrCreateVariable(varObj);
                                 varObj.exp = exp;
                                 varObj.id = varId;
@@ -3208,19 +3233,12 @@ export class GDBDebugSession extends LoggingDebugSession {
                             }
                         }
 
-                        response.body = {
-                            result: varObj.value,
-                            type: varObj.type,
-                            presentationHint: {
-                                kind: varObj.displayhint
-                            },
-                            variablesReference: varObj.id
-                        };
+                        response.body = varObj.toProtocolEvaluateResponseBody();
                         this.sendResponse(response);
                     }
                     catch (err) {
-                        if (isBusy()) {
-                            busyError(response, args);
+                        if (this.isBusy()) {
+                            this.busyError(response, args);
                         } else {
                             response.body = {
                                 result: (args.context === 'hover') ? null : `<${err.toString()}>`,
@@ -3236,13 +3254,8 @@ export class GDBDebugSession extends LoggingDebugSession {
                     finally {
                         resolve();
                     }
-                } else {
-                    // REPL: Set the proper thread/frame context before sending command to gdb. We don't know
-                    // what the command is but it needs to be run in the proper context.
+                } else {        // This is an 'repl'
                     try {
-                        if (!isBusy() && args.frameId) {
-                            await this.miDebugger.sendCommand(`stack-select-frame --thread ${threadId} ${frameId}`);
-                        }
                         this.miDebugger.sendUserInput(args.expression).then((output) => {
                             if (typeof output === 'undefined') {
                                 response.body = {

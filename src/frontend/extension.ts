@@ -9,12 +9,12 @@ import { BaseNode, PeripheralBaseNode } from './views/nodes/basenode';
 import { RTTCore, SWOCore } from './swo/core';
 import { NumberFormat, ConfigurationArguments,
     RTTCommonDecoderOpts, RTTConsoleDecoderOpts,
-    CortexDebugKeys, ChainedEvents, ADAPTER_DEBUG_MODE } from '../common';
+    CortexDebugKeys, ChainedEvents, ADAPTER_DEBUG_MODE, ChainedConfig } from '../common';
 import { MemoryContentProvider } from './memory_content_provider';
 import Reporting from '../reporting';
 
 import { CortexDebugConfigurationProvider } from './configprovider';
-import { SocketRTTSource, SocketSWOSource } from './swo/sources/socket';
+import { JLinkSocketRTTSource, SocketRTTSource, SocketSWOSource } from './swo/sources/socket';
 import { FifoSWOSource } from './swo/sources/fifo';
 import { FileSWOSource } from './swo/sources/file';
 import { SerialSWOSource } from './swo/sources/serial';
@@ -24,14 +24,13 @@ import { RTTTerminal } from './rtt_terminal';
 import { GDBServerConsole } from './server_console';
 import { CDebugSession, CDebugChainedSessionItem } from './cortex_debug_session';
 import { ServerConsoleLog } from '../backend/server';
-import { RTOSTracker } from './rtos/rtos';
+import { SVDParser } from './svd';
 
 const commandExistsSync = require('command-exists').sync;
 interface SVDInfo {
     expression: RegExp;
     path: string;
 }
-
 class ServerStartedPromise {
     constructor(
         public readonly name: string,
@@ -63,8 +62,6 @@ export class CortexDebugExtension {
         this.peripheralProvider = new PeripheralTreeProvider();
         this.registerProvider = new RegisterTreeProvider();
         this.memoryProvider = new MemoryContentProvider();
-
-        const rtosTracker = new RTOSTracker(context);
 
         let tmp = [];
         try {
@@ -108,6 +105,7 @@ export class CortexDebugExtension {
             vscode.commands.registerCommand('cortex-debug.toggleVariableHexFormat', this.toggleVariablesHexMode.bind(this)),
 
             vscode.commands.registerCommand('cortex-debug.examineMemory', this.examineMemory.bind(this)),
+            vscode.commands.registerCommand('cortex-debug.examineMemoryLegacy', this.examineMemoryLegacy.bind(this)),
             vscode.commands.registerCommand('cortex-debug.viewDisassembly', this.showDisassembly.bind(this)),
             vscode.commands.registerCommand('cortex-debug.setForceDisassembly', this.setForceDisassembly.bind(this)),
 
@@ -144,6 +142,34 @@ export class CortexDebugExtension {
                 e.element.expanded = false;
             })
         );
+
+        this.testSVDParser();
+    }
+
+    private testSVDParser() {
+        try {
+            if (false) {
+                const session: vscode.DebugSession = {
+                    id: 'blah',
+                    type: 'cortex-debug',
+                    name: 'blah',
+                    workspaceFolder: undefined,
+                    configuration: undefined,
+                    customRequest: (command: string, args?: any): Thenable<any> => {
+                        throw new Error('Function not implemented.');
+                    },
+                    getDebugProtocolBreakpoint: (breakpoint: any): Thenable<any> => {
+                        throw new Error('Function not implemented.');
+                    }
+                };
+                SVDParser.parseSVD(session, '/Users/hdm/Downloads/xmc7200.svd', 4).then((result) => {
+                    console.log('here');
+                }, (e) => {
+                    console.error('svd file parse failed', e);
+                });
+            }
+        }
+        catch (e) {}
     }
 
     private textDocsClosed(e: vscode.TextDocument) {
@@ -161,8 +187,25 @@ export class CortexDebugExtension {
     }
 
     private resetDevice() {
-        const session = CortexDebugExtension.getActiveCDSession();
+        let session = CortexDebugExtension.getActiveCDSession();
         if (session) {
+            let mySession = CDebugSession.FindSession(session);
+            const parentConfig = mySession.config?.pvtParent;
+            while (mySession && parentConfig) {
+                // We have a parent. See if our life-cycle is managed by our parent, if so
+                // send a reset to the parent instead
+                const chConfig = mySession.config?.pvtMyConfigFromParent as ChainedConfig;
+                if (chConfig?.lifecycleManagedByParent && parentConfig.__sessionId) {
+                    // __sessionId is not documented but has existed forever and used by VSCode itself
+                    mySession = CDebugSession.FindSessionById(parentConfig.__sessionId);
+                    if (!mySession) {
+                        break;
+                    }
+                    session = mySession.session || session;
+                } else {
+                    break;
+                }
+            }
             session.customRequest('reset-device', 'reset');
         }
     }
@@ -172,7 +215,6 @@ export class CortexDebugExtension {
             const rptMsg = 'Please report this problem.';
             this.gdbServerConsole = new GDBServerConsole(context, logFName);
             this.gdbServerConsole.startServer().then(() => {
-                console.log('GDB server console created');
                 resolve(); // All worked out
             }).catch((e) => {
                 this.gdbServerConsole.dispose();
@@ -370,6 +412,26 @@ export class CortexDebugExtension {
     }
 
     private examineMemory() {
+        const cmd = 'mcu-debug.memory-view.addMemoryView';
+        vscode.commands.executeCommand(cmd).then(() => { }, (e) => {
+            const installExt = 'Install MemoryView Extension';
+            vscode.window.showErrorMessage(
+                `Unable to execute ${cmd}. Perhaps the MemoryView extension is not installed. ` +
+                'Please install extension and try again. A restart may be needed', undefined,
+                {
+                    title: installExt
+                },
+                {
+                    title: 'Cancel'
+                }).then(async (v) => {
+                    if (v && (v.title === installExt)) {
+                        vscode.commands.executeCommand('workbench.extensions.installExtension', 'mcu-debug.memory-view');
+                    }
+                });
+        });
+    }
+
+    private examineMemoryLegacy() {
         function validateValue(address) {
             if (/^0x[0-9a-f]{1,8}$/i.test(address)) {
                 return address;
@@ -745,6 +807,9 @@ export class CortexDebugExtension {
                         vscode.window.showErrorMessage('Failed to launch chained configuration ' + launch.name);
                     }
                     CDebugChainedSessionItem.RemoveItem(child);
+                }, (e) => {
+                    vscode.window.showErrorMessage(`Failed to launch chained configuration ${launch.name}: ${e}`);
+                    CDebugChainedSessionItem.RemoveItem(child);
                 });
             }, delay);
             if (launch && launch.detached && (count > 0)) {
@@ -834,7 +899,7 @@ export class CortexDebugExtension {
         if (folder) {
             const orig = folder;
             const normalize = (fsPath: string) => {
-                fsPath = path.normalize(fsPath).replace('\\', '/');
+                fsPath = path.normalize(fsPath).replace(/\\/g, '/');
                 fsPath = (fsPath === '/') ? fsPath : fsPath.replace(/\/+$/, '');
                 if (process.platform === 'win32') {
                     fsPath = fsPath.toLowerCase();
@@ -975,11 +1040,15 @@ export class CortexDebugExtension {
                 resolve(src);
                 return;
             }
-            src = new SocketRTTSource(tcpPort, channel);
+            if (mySession.config.servertype === 'jlink') {
+                src = new JLinkSocketRTTSource(tcpPort, channel);
+            } else {
+                src = new SocketRTTSource(tcpPort, channel);
+            }
             mySession.rttPortMap[channel] = src;     // Yes, we put this in the list even if start() can fail
             resolve(src);                       // Yes, it is okay to resolve it even though the connection isn't made yet
             src.start().then(() => {
-                // Do nothing
+                mySession.session.customRequest('rtt-poll');
             }).catch((e) => {
                 vscode.window.showErrorMessage(`Could not connect to RTT TCP port ${tcpPort} ${e}`);
                 reject(e);

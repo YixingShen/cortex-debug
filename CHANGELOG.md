@@ -1,11 +1,80 @@
 ChangeLog
 =========
 
+# V1.6.10
+* [Issue#793 Container install broke from v1.6.7 to v1.6.9](https://github.com/Marus/cortex-debug/issues/793). It appears that VSCode does not install extensions with dependencies fully. Ie, if ext. `a` depends on `b` which depends on `c`, `c` is not installed so extension `a` fails to load properly. While we confirm, report this issue to VSCode folks, a (ugly) workaround has been implemented.
+
+# V1.6.9
+* The RTOS view has been moved to another extension so it can work with other debuggers. https://github.com/mcu-debug/rtos-views It will be automatically installed for you with this update. Note that the RTOS view related settings and commands now belong to the new extension (search for `RTOS` in Command Palette)
+* This release will also install the new memory view extension from https://github.com/mcu-debug/memview. The old memory view is still available (search for `legacy` in Command Palette)
+* Fix for [Issue#777](https://github.com/Marus/cortex-debug/issues/777). This supports a new (undocumented) type of watch-point. Depending on version of gdb a watch-point could be called `rwpt` or `awpt`, so we not accept both.
+* Fix for [Issue#786 SWO/RTT grapher cannot display](https://github.com/Marus/cortex-debug/issues/786)
+* Minor useability fixes
+
+# V1.6.8
+* [PR #761 pre, post and override Reset commands.](https://github.com/Marus/cortex-debug/pull/761) There are three new launch.json properties to customize the behavior of the `Reset` button. If they don't exist, they will correspond to the previous defaults which is to use the `Restart` counterparts
+* [Issue #772](OpenOCD server: Spelling mismatch for RTOS 'ChibiOS' vs. 'chibios') OpenOCD documentation which is what we rely on, had typos for official name of RTOSes. We had to through their C source code to determine the real ones. Please use `auto` for the RTOS value as it is pretty effective.
+* JLink now properly supports a `detach` operation so that programs can continue running after the debug session. Please upgrade your JLink SW to V7.82b or later.
+
+# V1.6.7
+* The old memory viewer is temporarily restored as a new command `Cortex-Debug: View Memory (Legacy)`. We will **not** be maintaining this legacy viewer but there may be capabilities there that are not yet in the new memory viewer. Like selection and copy to clipboard
+## Issues
+* [#769](https://github.com/Marus/cortex-debug/issues/769): Nested register cluster in SVD file is not displayed. The SVD spec changed in v1.3 nested clusters are now allowed. This is now supported by Cortex-Debug
+
+# V1.6.6
+* `void *` variables now return `memoryReference` values.
+* ST-LINK we now reserve four TCP ports when launching their gdb-server. We only use the first one but it done in case a second ST-LINK server is launched.
+* `Cortex-Debug: View Memory` command now uses a separate memory viewer extension if it is installed. https://marketplace.visualstudio.com/items?itemName=mcu-debug.memory-view. In the future, we may auto install the extension when this extension is installed. We would like to hear if you would like that. The download is about 1MB
+
+# V1.6.4
+* Issue #741: Could not determine gdb version from Fedora install
+
+# V1.6.3
+* Issue #730 fixed where bulk breakpoint changes would cause issues and some breakpoint actions would fail. Like enable/disable/delete all breakpoints.
+* Mitigation for Issue #725 with extraneous/dummy symbols masking real ones
+
+# V1.6.1
+* Bit more lenient parsing of GDB version number for custom builds. We still need to know the version number
+  
+# V1.6.1
+* Better error message when using GDB version less than 9. Starting with 1.5.2, we no longer support GDB version <= 8. For most of last year, we have been warning users of this happening in July 2022. This now August 2022 :-)
+
+# V1.6.0
+* Please see all the notes from the pre-releases (1.5.x). Following are the highlights
+* **RTOS Views**: Support for uC/OS-II & embOS, thanks to  @PhilippHaefele & @mayjs for adding them. Just a reminder, anyone can contribute their favorite RTOS if you have a bit of knowledge of TypeScript/JavaScript and more importantly, knowledge of RTOS internals
+* You can also use **Microsoft Embedded Tools** and their RTOS views as we are now compatible with each other
+* Microsoft Embedded Tools also added compatibility for Cortex-Debug for their version of Peripheral Views/Registers. They also helped with integrating Cortex-Debug with MS built-in Hex-Editor. To use MS Peripheral View, use `svdPath` in launch.json. `svdFile` uses the SVD feature from Cortex-Debug. You can use both at the same time if you wish but you should typically use only one.
+* Fixed a long standing issue with OpenOCD RTT where there was no good way to know when to start the RTT. We can now poll until RTT is detected and enabled. See `rttConfig.rtt_start_retry` in your launch.json to control who the polling works.
+* Support for loading alternate symbol files instead of the `"executable"` using a new launch.json property `"symbolFiles"`. See the Wiki [documentation here](https://github.com/Marus/cortex-debug/wiki/Overview#debug-files). This is in addition to the already existing `"loadFiles"` which is used to customizing the programming of the device
+* You can now use `breakAfterReset` and `runToEntryPoint` for an `attach` type launch configuration as well but they will only be used on a reset/restart.
+* For chained configuration, the parent can override properties of children and/or allow children to inherit from itself using `overrides` and `inherits`.
+* Of course, many issues fixed: thanks to the community with reporting them helping fixing them
+
+# V1.5.5
+* Enables `Peripheral View` provided by `Embedded Tools` extension from Microsoft. You can request this by specifying `svdPath` property in `launch.json`. `svdFile` still remains and that will display a window named 'Cortex Peripherals'. For now, you can use both but will require twice as many memory reads. Make slow down fast single stepping.
+
+# V1.5.4
+* Version 1.5.3 has accidentally enabled some debug info that is should not have enabled during production. Corrected
+
+# V1.5.3
+
+## New features and fixes
+* Serial port changes: We have no changed how serial ports are supported. We now rely on the Serial Monitor extension from Microsoft to provide a copy of the `serialport` NPM module or you can compile it for cortex-debug yourself. The latter is always preferred. We do this because `serialport` is a binary module and requires it to be compiled using the exact version of Electron and Node that VSCode is built upon. This has become very difficult to support for every OS/Processor combination and it was also increasing the size of the corte-debug package -- exceeding the limits set by Microsoft
+* Cortex-Debug RTOS views will now work with MS `cppdbg` debugger and vice versa. You can use both or either or none. Until the next release, you will need pre-release versions of the Microsoft Embedded tools and this extension.
+* Thanks to a PR by MS embedded folks, you can now have memory views for pointers from the Variable and Watch windows.
+  
 # V1.5.2
 
 ## New features
-* RTOS View for uC/OS-II. Added by @PhilippHaefele & @mayjs via PR [#642](https://github.com/Marus/cortex-debug/pull/642) 
+* RTOS View for uC/OS-II. Added by @PhilippHaefele & @mayjs via PR [#642](https://github.com/Marus/cortex-debug/pull/642)
+* RTOS View for embOS. Added by @PhilippHaefele via PR [#705](https://github.com/Marus/cortex-debug/pull/705)
 * Better error handling during RTOS initial queries
+* Memory references are returned from DAP evaluate requests. PR [#694](https://github.com/Marus/cortex-debug/pull/694)
+* RTT with OpenOCD will attempt to retry the `rtt start` command if the first attempt fails. This is done as a background task. The retry interval is controlled by `rtt_start_retry` option in `rttConfig` (default is 1000 ms)
+* Issue #698: Windows only, fixed path-name issues with `loadFiles` and a couple of other places
+* PR #700: RTT with JLink can now be used with any valid channel (0-15) but you can only have one channel per session which is limited by JLink server. Before, only channel#0 was allowed
+* Issue [#689](https://github.com/Marus/cortex-debug/issues/689) fixed
+* Reset button now resets all cores (using lifecycle management rules) and works the same as Restart
 
 # V1.5.1
 ## New features

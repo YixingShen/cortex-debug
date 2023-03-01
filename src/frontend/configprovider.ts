@@ -7,7 +7,23 @@ import { ADAPTER_DEBUG_MODE, ChainedConfigurations, ChainedEvents, CortexDebugKe
 import { CDebugChainedSessionItem, CDebugSession } from './cortex_debug_session';
 import * as path from 'path';
 
-const OPENOCD_VALID_RTOS: string[] = ['ChibiOS', 'eCos', 'embKernel', 'FreeRTOS', 'mqx', 'nuttx', 'ThreadX', 'uCOS-III', 'auto'];
+// Please confirm these names with OpenOCD source code. Their docs are incorrect as to case
+const OPENOCD_VALID_RTOS: string[] = [
+    'auto',
+    'FreeRTOS',
+    'ThreadX',
+    'chibios',
+    'Chromium-EC',
+    'eCos',
+    'embKernel',
+    // 'hwthread',
+    'linux',
+    'mqx',
+    'nuttx',
+    'RIOT',
+    'uCOS-III',
+    'Zephyr'
+];
 const JLINK_VALID_RTOS: string[] = ['Azure', 'ChibiOS', 'embOS', 'FreeRTOS', 'NuttX', 'Zephyr'];
 
 export class CortexDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
@@ -78,11 +94,17 @@ export class CortexDebugConfigurationProvider implements vscode.DebugConfigurati
         if (!config.postAttachCommands) { config.postAttachCommands = []; }
         if (!config.preRestartCommands) { config.preRestartCommands = []; }
         if (!config.postRestartCommands) { config.postRestartCommands = []; }
+        if (!config.preResetCommands) { config.preResetCommands = config.preRestartCommands; }
+        if (!config.postResetCommands) { config.postResetCommands = config.postRestartCommands; }
         if (config.runToEntryPoint) { config.runToEntryPoint = config.runToEntryPoint.trim(); }
         else if (config.runToMain) {
             config.runToEntryPoint = 'main';
             vscode.window.showWarningMessage(
                 'launch.json: "runToMain" has been deprecated and will not work in future versions of Cortex-Debug. Please use "runToEntryPoint" instead');
+        }
+
+        if ((type !== 'openocd') || !config.ctiOpenOCDConfig?.enabled) {
+            delete config.ctiOpenOCDConfig;
         }
 
         switch (type) {
@@ -170,6 +192,9 @@ export class CortexDebugConfigurationProvider implements vscode.DebugConfigurati
             cwd = path.join(folder.uri.fsPath, cwd);
         }
         config.cwd = cwd;
+        if (!fs.existsSync(cwd)) {
+            vscode.window.showWarningMessage(`Invalid "cwd": "${cwd}". Many operations can fail. Trying to continue`);
+        }
         this.validateLoadAndSymbolFiles(config, cwd);
 
         const extension = vscode.extensions.getExtension('marus25.cortex-debug');
@@ -225,7 +250,7 @@ export class CortexDebugConfigurationProvider implements vscode.DebugConfigurati
             for (const symF of symFiles) {
                 let exe = symF.file;
                 exe = path.isAbsolute(exe) ? exe : path.join(cwd, exe);
-                exe = path.normalize(exe).replace('\\', '/');
+                exe = path.normalize(exe).replace(/\\/g, '/');
                 if (!config.symbolFiles) {
                     config.executable = exe;
                 } else {
@@ -256,7 +281,7 @@ export class CortexDebugConfigurationProvider implements vscode.DebugConfigurati
             for (let ix = 0; ix < config.loadFiles.length; ix++) {
                 let fName = config.loadFiles[ix];
                 fName = path.isAbsolute(fName) ? fName : path.join(cwd, fName);
-                fName = path.normalize(fName).replace('\\', '/');
+                fName = path.normalize(fName).replace(/\\/g, '/');
                 config.loadFiles[ix] = fName;
             }
         }
@@ -416,11 +441,19 @@ export class CortexDebugConfigurationProvider implements vscode.DebugConfigurati
         }
 
         if (config.rttConfig && config.rttConfig.enabled && config.rttConfig.decoders && (config.rttConfig.decoders.length !== 0)) {
+            let chosenPort;
             for (const dec of config.rttConfig.decoders) {
                 if (dec.port === undefined) {
                     dec.port = 0;
-                } else if (dec.port !== 0) {
-                    return `Invalid port/channel '${dec.port}'. JLink RTT port/channel has to be 0 because that is the only one supported by JLinkGDBServer`;
+                } else if (dec.port < 0 || dec.port > 15) {
+                    return `Invalid port/channel '${dec.port}'.  JLink RTT port/channel must be between 0 and 15.`;
+                }
+
+                if ((chosenPort !== undefined) && (chosenPort !== dec.port)) {
+                    return `Port/channel ${dec.port} selected but another decoder is using port ${chosenPort}. ` +
+                        'JLink RTT only allows a single RTT port/channel per debugging session.';
+                } else {
+                    chosenPort = dec.port;
                 }
             }
         }
@@ -471,7 +504,8 @@ export class CortexDebugConfigurationProvider implements vscode.DebugConfigurati
         this.setOsSpecficConfigSetting(config, 'serverpath', 'openocdPath');
 
         if (config.rtos && OPENOCD_VALID_RTOS.indexOf(config.rtos) === -1) {
-            return `The following RTOS values are supported by OpenOCD: ${OPENOCD_VALID_RTOS.join(' ')}`;
+            return `The following RTOS values are supported by OpenOCD: ${OPENOCD_VALID_RTOS.join(' ')}.` +
+                'You can always use "auto" and OpenOCD generally does the right thing';
         }
 
         if (!CDebugChainedSessionItem.FindByName(config.name)) {

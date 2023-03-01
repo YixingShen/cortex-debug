@@ -18,7 +18,7 @@ export function ServerConsoleLog(str: string, usePid?: number) {
             GdbPid = usePid;
         }
         str = `[${date.toISOString()}] ppid=${process.pid} pid=${GdbPid} ` + str;
-        console.log(str);
+        // console.log(str);
         if (true) {
             if (!str.endsWith('\n')) {
                 str += '\n';
@@ -39,8 +39,8 @@ export class GDBServer extends EventEmitter {
     protected consoleSocket: net.Socket = null;
     private initResolve: (result: boolean) => void;
     private initReject: (error: any) => void;
-    //public static readonly SERVER_TIMEOUT = 10000; //org
-    public static readonly SERVER_TIMEOUT = 30000; //YX 20220513
+    //public static readonly SERVER_TIMEOUT = 10000;
+    public static readonly SERVER_TIMEOUT = 500000; //YX 20230224
     public static readonly LOCALHOST = '0.0.0.0';
     public pid: number = -1;
 
@@ -252,7 +252,7 @@ export class GDBServer extends EventEmitter {
 // See GDBDebugSession.disconnectRequest()
 process.on('exit', (code, signal) => {
     if (currentServers.length > 0) {
-        ServerConsoleLog(`Debug Adapter killed by VSCode? code=${code} signal=${signal}`);
+        ServerConsoleLog(`Debug Adapter crashed or killed by VSCode? code=${code} signal=${signal}`);
         for (const p of [...currentServers]) {
             p.exit();
         }

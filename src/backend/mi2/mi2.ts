@@ -64,6 +64,7 @@ export class MI2 extends EventEmitter implements IBackend {
     public pid: number = -1;
     protected lastContinueSeqId = -1;
     protected actuallyStarted = false;
+    protected isExiting = false;
     // public gdbVarsPromise: Promise<MINode> = null;
 
     constructor(public application: string, public args: string[]) {
@@ -71,12 +72,14 @@ export class MI2 extends EventEmitter implements IBackend {
     }
 
     public start(cwd: string, init: string[]): Promise<void> {
-        return new Promise<void>((resolve, reject) => {
+        return new Promise<void>(async (resolve, reject) => {
             this.process = ChildProcess.spawn(this.application, this.args, { cwd: cwd, env: this.procEnv });
             this.pid = this.process.pid;
             this.process.stdout.on('data', this.stdout.bind(this));
             this.process.stderr.on('data', this.stderr.bind(this));
-            this.process.on('exit', this.onExit.bind(this));
+            this.process.on('exit', (code: number, signal: string) => {
+                this.onExit(code, signal);
+            });
             this.process.on('error', this.onError.bind(this));
             this.process.on('spawn', () => {
                 ServerConsoleLog(`GDB started ppid=${process.pid} pid=${this.process.pid}`, this.process.pid);
@@ -86,35 +89,51 @@ export class MI2 extends EventEmitter implements IBackend {
                 this.gdbStartError();
                 reject(new Error('Could not start gdb, no response from gdb'));
                 timeout = undefined;
-            }, 2000);
+            }, 5000);
 
             const swallOutput = this.debugOutput ? false : true;
-            this.sendCommand('gdb-version', false, true, swallOutput).then((v: MINode) => {
+            let v;
+            try {
+                v = await this.sendCommand('gdb-version', false, true, swallOutput);
                 if (timeout) {
                     clearTimeout(timeout);
+                } else {
+                    return;
                 }
-                this.actuallyStarted = true;
-                this.parseVersionInfo(v.output);
-                const asyncCmd = this.gdbMajorVersion >= 8 ? 'gdb-set mi-async on' : 'gdb-set target-async on';
-                const promises = [asyncCmd, ...init].map((c) => this.sendCommand(c));
-                Promise.all(promises).then(() => {
-                    /*
-                    gdb crashes or runs out of memory with the following
-                    if (this.gdbMajorVersion >= 9) {
-                        this.gdbVarsPromise = new Promise((resolve) => {
-                            this.sendCommand('symbol-info-variables', false, false, true).then((x) => {
-                                resolve(x);
-                            }, (e) => {
-                                reject(e);
-                            });
-                        });
-                    }
-                    */
-                    resolve();
-                }, reject);
-            }, (e) => {
+            }
+            catch (e) {
                 reject(e);
-            });
+                return;
+            }
+            this.actuallyStarted = true;
+            this.parseVersionInfo(v.output);
+            if ((this.gdbMajorVersion !== undefined) && (this.gdbMajorVersion < 9)) {
+                this.isExiting = true;
+                const ver = this.gdbMajorVersion ? this.gdbMajorVersion.toString() : 'Unknown';
+                const msg = `ERROR: GDB major version should be >= 9, yours is ${ver}`;
+                this.log('stderr', msg);
+                this.sendRaw('-gdb-exit');
+                // reject(new Error(msg));
+                resolve();
+                return;
+            }
+            const asyncCmd = 'gdb-set mi-async on';
+            const promises = [asyncCmd, ...init].map((c) => this.sendCommand(c));
+            Promise.all(promises).then(() => {
+                /*
+                gdb crashes or runs out of memory with the following
+                if (this.gdbMajorVersion >= 9) {
+                    this.gdbVarsPromise = new Promise((resolve) => {
+                        this.sendCommand('symbol-info-variables', false, false, true).then((x) => {
+                            resolve(x);
+                        }, (e) => {
+                            reject(e);
+                        });
+                    });
+                }
+                */
+                resolve();
+            }, reject);
         });
     }
 
@@ -123,18 +142,19 @@ export class MI2 extends EventEmitter implements IBackend {
     }
 
     private parseVersionInfo(str: string) {
-        const regex = RegExp(/^GNU gdb\s\(.*\)\s?(\d+)\.(\d+)\.[^\r\n]*/gm);
+        const regex = RegExp(/^GNU gdb.*\s(\d+)\.(\d+)[^\r\n]*/gm);
         const match = regex.exec(str);
         if (match !== null) {
             str = str.substr(0, match.index);
             this.gdbMajorVersion = parseInt(match[1]);
             this.gdbMinorVersion = parseInt(match[2]);
-            if (this.gdbMajorVersion < 9) {
-                this.log('stderr', 'WARNING: Cortex-Debug will deprecate use of GDB version 8 after July 2022. Please upgrade to version 9+\n');
-            }
         }
         if (str) {
             this.log('console', str);
+        }
+        if (match === null) {
+            this.log('log', 'ERROR: Could not determine gdb-version number (regex failed). We need version >= 9. Please report this problem.');
+            this.log('log', '    This can result in silent failures');
         }
     }
 
@@ -148,22 +168,26 @@ export class MI2 extends EventEmitter implements IBackend {
         });
     }
 
-    private onExit() {
+    private onExit(code: number, signal: string) {
         this.gdbStartError();
         ServerConsoleLog('GDB: exited', this.pid);
         if (this.process) {
             this.process = null;
             this.exited = true;
-            this.emit('quit');
+            // Unless we are the ones initiating the quitting,
+            const codestr = code === null || code === undefined ? 'none' : code.toString();
+            const sigstr = signal ? `, signal: ${signal}` : '';
+            const how = this.exiting ? '' : ((code || signal) ? ' unexpectedly' : '');
+            const msg = `GDB session ended${how}. exit-code: ${codestr}${sigstr}\n`;
+            this.emit('quit', how ? 'stderr' : 'stdout', msg);
         }
     }
 
     private gdbStartError() {
         if (!this.actuallyStarted) {
-            this.log('log', 'Error: Unable to start GDB. Make sure you can start gdb from the command-line and run any command like "echo hello".\n');
-            if (os.platform() === 'linux') {
-                this.log('log', '    If you cannot, it is most likely because "libncurses5" is not installed.\n');
-            }
+            this.log('log', 'Error: Unable to start GDB even after 5 seconds or it couldn\'t even start ' +
+                'Make sure you can start gdb from the command-line and run any command like "echo hello".\n');
+            this.log('log', '    If you cannot, it is most likely because "libncurses" or "python" is not installed. Some GDBs require these\n');
         }
     }
 
@@ -384,7 +408,7 @@ export class MI2 extends EventEmitter implements IBackend {
             }
             catch (e) {
                 this.log('log', `kill failed for ${-proc.pid}` + e);
-                this.onExit();      // Process already died or quit. Cleanup
+                this.onExit(-1, '');      // Process already died or quit. Cleanup
             }
         }
     }
@@ -723,7 +747,7 @@ export class MI2 extends EventEmitter implements IBackend {
             const aType = breakpoint.accessType === 'read' ? '-r' : (breakpoint.accessType === 'readWrite' ? '-a' : '');
             this.sendCommand(`break-watch ${aType} ${bkptArgs}`).then((result) => {
                 if (result.resultRecords.resultClass === 'done') {
-                    const bkptNum = parseInt(result.result('hw-awpt.number') || result.result('wpt.number'));
+                    const bkptNum = parseInt(result.result('hw-awpt.number') || result.result('hw-rwpt.number') || result.result('wpt.number'));
                     breakpoint.number = bkptNum;
 
                     if (breakpoint.condition) {
@@ -827,21 +851,26 @@ export class MI2 extends EventEmitter implements IBackend {
             this.log('stderr', 'getStackVariables');
         }
 
-        const result = await this.sendCommand(`stack-list-variables --thread ${thread} --frame ${frame} --simple-values`);
-        const variables = result.result('variables');
-        const ret: Variable[] = [];
-        for (const element of variables) {
-            const key = MINode.valueOf(element, 'name');
-            const value = MINode.valueOf(element, 'value');
-            const type = MINode.valueOf(element, 'type');
-            ret.push({
-                name: key,
-                valueStr: value,
-                type: type,
-                raw: element
-            });
+        try {
+            const result = await this.sendCommand(`stack-list-variables --thread ${thread} --frame ${frame} --simple-values`);
+            const variables = result.result('variables');
+            const ret: Variable[] = [];
+            for (const element of variables) {
+                const key = MINode.valueOf(element, 'name');
+                const value = MINode.valueOf(element, 'value');
+                const type = MINode.valueOf(element, 'type');
+                ret.push({
+                    name: key,
+                    valueStr: value,
+                    type: type,
+                    raw: element
+                });
+            }
+            return Promise.resolve(ret);
         }
-        return ret;
+        catch (e) {
+            return Promise.reject(e);
+        }
     }
 
     public examineMemory(from: number, length: number): Thenable<any> {
@@ -990,6 +1019,9 @@ export class MI2 extends EventEmitter implements IBackend {
     }
 
     public isRunning(): boolean {
+        if (this.isExiting) {
+            return false;
+        }
         return !!this.process;
     }
 

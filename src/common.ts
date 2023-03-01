@@ -6,6 +6,7 @@ import { GDBServer } from './backend/server';
 import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as stream from 'stream';
+import { GDBDebugSession } from './gdb';
 const readline = require('readline');
 
 export enum ADAPTER_DEBUG_MODE {
@@ -114,6 +115,14 @@ export enum BinaryEncoding {
     Q1616 = 'Q16.16',
     FLOAT = 'float'
 }
+
+export interface CTIOpenOCDConfig {
+    enabled: boolean;
+    initCommands: string[];
+    pauseCommands: string[];
+    resumeCommands: string[];
+}
+
 export interface RTTConsoleDecoderOpts extends RTTCommonDecoderOpts {
     // Console  options
     label: string;      // label for window
@@ -203,6 +212,7 @@ export interface RTTConfiguration {
     searchId: string;
     clearSearch: boolean;
     polling_interval: number;
+    rtt_start_retry: number;
     decoders: RTTCommonDecoderOpts[];
 }
 
@@ -254,17 +264,21 @@ export interface ConfigurationArguments extends DebugProtocol.LaunchRequestArgum
     preRestartCommands: string[];
     postRestartCommands: string[];
     overrideRestartCommands: string[];
+    preResetCommands: string[];
+    postResetCommands: string[];
+    overrideResetCommands: string[];
     postStartSessionCommands: string[];
     postRestartSessionCommands: string[];
     overrideGDBServerStartedRegex: string;
     breakAfterReset: boolean;
     svdFile: string;
     svdAddrGapThreshold: number;
+    ctiOpenOCDConfig: CTIOpenOCDConfig;
     rttConfig: RTTConfiguration;
     swoConfig: SWOConfiguration;
     graphConfig: any[];
     /// Triple slashes will cause the line to be ignored by the options-doc.py script
-    /// We dont expect the following to be in booleann form or have the value of 'none' after
+    /// We don't expect the following to be in booleann form or have the value of 'none' after
     /// The config provider has done the conversion. If it exists, it means output 'something'
     showDevDebugOutput: ADAPTER_DEBUG_MODE;
     showDevDebugTimestamps: boolean;
@@ -285,6 +299,7 @@ export interface ConfigurationArguments extends DebugProtocol.LaunchRequestArgum
     pvtMyConfigFromParent: ChainedConfig;     // My configuration coming from the parent
     pvtAvoidPorts: number[];
     pvtVersion: string;                       // Version from package.json
+    pvtOpenOCDDebug: boolean;
 
     numberOfProcessors: number;
     targetProcessor: number;
@@ -330,6 +345,12 @@ export interface DisassemblyInstruction {
     opcodes: string;
 }
 
+export enum CTIAction {
+    'init',
+    'pause',
+    'resume'
+}
+
 export interface GDBServerController extends EventEmitter {
     portsNeeded: string[];
     name: string;
@@ -349,8 +370,10 @@ export interface GDBServerController extends EventEmitter {
     initMatch(): RegExp;
     serverLaunchStarted(): void;
     serverLaunchCompleted(): Promise<void> | void;
-    debuggerLaunchStarted(): void;
+    debuggerLaunchStarted(obj?: GDBDebugSession): void;
     debuggerLaunchCompleted(): void;
+    rttPoll?(): void;
+    ctiStopResume?(action: CTIAction): void;
 }
 
 export function genDownloadCommands(config: ConfigurationArguments, preLoadCmds: string[]) {
@@ -360,7 +383,7 @@ export function genDownloadCommands(config: ConfigurationArguments, preLoadCmds:
         } else {
             const ret = [...preLoadCmds];
             for (const f of config.loadFiles) {
-                const tmp = f.replace('\\', '/');
+                const tmp = f.replace(/\\/g, '/');
                 ret.push(`file-exec-file "${tmp}"`, 'target-download');
             }
             return ret;
@@ -424,7 +447,8 @@ export class RTTServerHelper {
         });
     }
 
-    public emitConfigures(cfg: RTTConfiguration, obj: EventEmitter) {
+    public emitConfigures(cfg: RTTConfiguration, obj: EventEmitter): boolean {
+        let ret = false;
         if (cfg.enabled) {
             for (const dec of cfg.decoders) {
                 if (dec.tcpPort || dec.tcpPorts) {
@@ -432,9 +456,11 @@ export class RTTServerHelper {
                         type: 'socket',
                         decoder: dec
                     }));
+                    ret = true;
                 }
             }
         }
+        return ret;
     }
 }
 
