@@ -303,6 +303,7 @@ export interface ConfigurationArguments extends DebugProtocol.LaunchRequestArgum
 
     numberOfProcessors: number;
     targetProcessor: number;
+    serverTimeout: number; //YX 20230308 add userDef serverTimeout
 
     // J-Link Specific
     ipAddress: string;

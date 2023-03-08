@@ -477,6 +477,7 @@ export class GDBDebugSession extends LoggingDebugSession {
                 return doResolve();
             }
 
+            const gdbServerTimeout = this.args.serverTimeout; //YX 20230308 add userDef serverTimeout
             const ControllerClass = SERVER_TYPE_MAP[this.args.servertype];
             this.serverController = new ControllerClass();
             this.serverController.setArguments(this.args);
@@ -556,7 +557,8 @@ export class GDBDebugSession extends LoggingDebugSession {
                     ));
                     this.launchErrorResponse(response, 103, `Failed to launch ${this.serverController.name || this.args.servertype} GDB Server: Timeout.`);
                     doResolve();
-                }, GDBServer.SERVER_TIMEOUT);
+                //}, GDBServer.SERVER_TIMEOUT);
+                }, gdbServerTimeout);
 
                 this.serverController.serverLaunchStarted();
                 this.server.init().then(async (started) => {

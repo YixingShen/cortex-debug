@@ -2,7 +2,7 @@ out
 /node_modules
 /webview/node_modules
 /binary_modules/*/node_modules
-*.vsix
+#*.vsix
 .vscode-test
 .DS_Store
 .sass-cache

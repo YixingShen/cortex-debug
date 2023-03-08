@@ -40,7 +40,7 @@ export class GDBServer extends EventEmitter {
     private initResolve: (result: boolean) => void;
     private initReject: (error: any) => void;
     //public static readonly SERVER_TIMEOUT = 10000;
-    public static readonly SERVER_TIMEOUT = 500000; //YX 20230224
+    //public static readonly SERVER_TIMEOUT = 500000; //YX 20230224
     public static readonly LOCALHOST = '0.0.0.0';
     public pid: number = -1;
 
