@@ -1,6 +1,25 @@
 ChangeLog
 =========
 
+# V1.9.1 - Major release only available as a Pre-release.
+* The Registers Panel is now removed. We had deprecated this window a year ago as it would not give you accurate register values based on the Program/Thread/Frame. The accurate version of the Registers have been available in the VARIABLES panel for almost a year now.
+* Fixed some issue when the Live Watch window was empty or variables added while there wasn't a debug session sometimes would not show
+* Bugfix: Potential fix for [Issue#840: Variables mixed with a bunch of configuration constants]. Not really a bug but in somecases, the ELF file contained a bunch of symbols that were marked as real object which in fact are not. Trying to filter them out.
+
+# V1.9.0 - Major release only available as a Pre-release.
+* Sorry we had some version number issues. This release was accidentally released as a production 1.7.1 and to undo that, we had to jump two minor versions numbers to keep up with VSCode versioning scheme. Apologies for the confusion.
+* This is a preview (Pre-release). The biggest feature is the addition of Live Watch. In your launch.json add an object property called `liveWatch` and Intellisense should fill out a template to enable Live Watch.
+  ```
+    "liveWatch": {
+        "enabled": true,
+        "samplesPerSecond": 4
+    },
+  ```
+* **MAJOR MAJOR change**: The Peripherals (SVD) panel is now maintained in a separate extension. We are disabling SVD support in this extension. Please refer to https://github.com/mcu-debug/peripheral-viewer. The new panel will show up as 'XPERIPHERALS'. You don't have to make any changes in your configurations. Things should just migrate over. Fingers crossed
+* There are tons of other changes planned as pre-releases and they will have versions 1.7.x (this is a Microsoft convention). There has been some major restructuring of our code and as such, this version may not be as stable as the production releases. **Please help us get to production**
+* To enable Pre-releases, you have use the Extension Manager/Pane within VSCode
+* Bugfix: [#831 Unable to read variables during 2nd breakpoint stop](https://github.com/Marus/cortex-debug/issues/831)
+
 # V1.6.10
 * [Issue#793 Container install broke from v1.6.7 to v1.6.9](https://github.com/Marus/cortex-debug/issues/793). It appears that VSCode does not install extensions with dependencies fully. Ie, if ext. `a` depends on `b` which depends on `c`, `c` is not installed so extension `a` fails to load properly. While we confirm, report this issue to VSCode folks, a (ugly) workaround has been implemented.
 

@@ -70,7 +70,7 @@ export class VariableObject {
     public id: number;
     public fullExp: string;
     public parent: number;      // Variable Reference
-    public children: {[name: string]: string};
+    public children: {[name: string]: string};  // Field-name to Gdb-variable map
     constructor(p: number, node: any) {
         this.parent = p;
         this.name = MINode.valueOf(node, 'name');
@@ -110,8 +110,9 @@ export class VariableObject {
             this.value = def;
         }
         */
-        if (!!MINode.valueOf(node, 'type_changed')) {
-            this.type = MINode.valueOf(node, 'new_type');
+        const typeChanged = MINode.valueOf(node, 'type_changed');
+        if (typeChanged === 'true') {
+            this.type = MINode.valueOf(node, 'new_type') || this.type;
         }
         this.dynamic = !!MINode.valueOf(node, 'dynamic');
         this.displayhint = MINode.valueOf(node, 'displayhint');
