@@ -179,6 +179,7 @@ export class CortexDebugConfigurationProvider implements vscode.DebugConfigurati
             return undefined;
         }
 
+        config.serverTimeout = configuration.get('serverTimeout', 500000);  //YX 20230308 add userDef serverTimeout
         return config;
     }
 
